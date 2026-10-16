@@ -274,6 +274,8 @@ input,select,textarea{font-size:16px}
   .user-chip{flex:1;justify-content:center}
   .grid{grid-template-columns:repeat(2,1fr)}
   .days-bar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .days-bar.single-day{display:flex;justify-content:center}
+  .days-bar.single-day .day-btn{padding:10px 28px}
   .day-btn{padding:10px 4px;font-size:15px}
   .sched-wrap{overflow:visible;background:none;border:0;box-shadow:none}
   table.sched,table.sched tbody{display:block;min-width:0;background:none}
@@ -356,6 +358,8 @@ const FRESH_MS=15000;
 let db={users:[],sched:{}};
 const baseSched={};
 const loadedAt={};
+let activeDay=0;
+let activeDayLoadedAt=0;
 
 function clone(x){return JSON.parse(JSON.stringify(x));}
 function newId(){return 'n'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
@@ -365,6 +369,7 @@ function isDirty(key){return JSON.stringify(db.sched[key])!==JSON.stringify(base
 function onKey(key){return view.page==='schedule'&&(GRADES[view.grade]+'|'+view.section+'|'+DAYS[view.day])===key;}
 function validUsername(u){return /^[a-z0-9._-]{3,30}$/.test(u);}
 function toEmail(u){return u+'@'+EMAIL_DOMAIN;}
+function isSuperUser(){return Boolean(currentUser&&currentUser.role==='super');}
 
 /* ---- Firebase loader ---- */
 let fbPromise=null;
@@ -428,6 +433,36 @@ function mergeRows(base,local,server){
   return out;
 }
 
+async function loadActiveDay(force){
+  if(!force&&activeDayLoadedAt&&Date.now()-activeDayLoadedAt<=FRESH_MS)return activeDay;
+  const f=await loadFirebase();
+  const snap=await f.fs.getDoc(f.fs.doc(f.store,'schedule','active_day'));
+  if(snap.exists()){
+    const d=snap.data().day;
+    if(typeof d==='number'&&d>=0&&d<DAYS.length)activeDay=d;
+  }
+  activeDayLoadedAt=Date.now();
+  return activeDay;
+}
+
+async function switchDayBySuper(dayIdx){
+  if(!isSuperUser())return;
+  activeDay=dayIdx;
+  view.day=dayIdx;
+  activeDayLoadedAt=Date.now();
+  render();
+  try{
+    const f=await loadFirebase();
+    await f.fs.setDoc(f.fs.doc(f.store,'schedule','active_day'),{
+      day:dayIdx,
+      updatedAt:f.fs.serverTimestamp(),
+      updatedBy:currentUser.u
+    });
+  }catch(e){
+    showSavedMsg('❌ '+errText(e),true);
+  }
+}
+
 async function loadDay(key){
   const f=await loadFirebase();
   const snap=await f.fs.getDoc(f.fs.doc(f.store,'schedule',docIdFor(key)));
@@ -486,12 +521,13 @@ async function doLogin(){
       err.textContent='هذا الحساب موقوف. تواصل مع المدير العام';return;
     }
     currentUser={uid,u:prof.u,name:prof.name,role:prof.role,active:prof.active};
+    try{await loadActiveDay(true);}catch(e){}
     document.getElementById('loginPass').value='';
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
     document.getElementById('userChip').textContent='👤 '+currentUser.name+' ('+(currentUser.role==='super'?'مدير عام':'معلم')+')';
     document.getElementById('adminBtn').style.display=currentUser.role==='super'?'':'none';
-    view={page:'grades',grade:null,section:null,day:0};
+    view={page:'grades',grade:null,section:null,day:activeDay};
     render();
   }catch(e){
     err.textContent=errText(e);
@@ -508,7 +544,8 @@ function enterGuest(){
   document.getElementById('app').classList.remove('hidden');
   document.getElementById('userChip').textContent='👁️ وضع العرض فقط';
   document.getElementById('adminBtn').style.display='none';
-  view={page:'grades',grade:null,section:null,day:0};
+  view={page:'grades',grade:null,section:null,day:activeDay};
+  loadActiveDay(true).then(()=>{view.day=activeDay;if(view.page==='schedule')render();}).catch(()=>{});
   render();
 }
 function doLogout(){location.reload();}
@@ -535,8 +572,8 @@ function renderGrades(){
   });
   main.innerHTML=h+'</div>';
 }
-function openGrade(i){view={page:'sections',grade:i,section:null,day:0};render();}
-function openSection(s){view.page='schedule';view.section=s;render();}
+function openGrade(i){view={page:'sections',grade:i,section:null,day:activeDay};render();}
+function openSection(s){view.page='schedule';view.section=s;view.day=activeDay;render();}
 
 function renderSections(){
   main.innerHTML=`
@@ -549,32 +586,43 @@ function renderSections(){
 }
 
 function scheduleHead(g,s){
+  const superMode=isSuperUser();
+  const daysHtml=superMode
+    ? `<div class="days-bar">${DAYS.map((dd,i)=>`<button class="day-btn ${i===view.day?'active':''}" onclick="switchDayBySuper(${i})">${dd}</button>`).join('')}</div>`
+    : `<div class="days-bar single-day"><button class="day-btn active" style="cursor:default">${DAYS[view.day]}</button></div>`;
   return `
   <span class="back-link" onclick="view.page='sections';render()">→ رجوع لشُعب ${g}</span>
   <h2 class="page-title">${g} — شعبة ${s}</h2>
-  <div class="days-bar">${DAYS.map((dd,i)=>`<button class="day-btn ${i===view.day?'active':''}" onclick="view.day=${i};render()">${dd}</button>`).join('')}</div>`;
+  ${daysHtml}`;
 }
 function needsLoad(key){
+  if(!activeDayLoadedAt||(!isSuperUser()&&Date.now()-activeDayLoadedAt>FRESH_MS))return true;
   if(!db.sched[key])return true;
   return !isDirty(key)&&Date.now()-(loadedAt[key]||0)>FRESH_MS;
 }
-function showDay(key,g,s){
+function showDay(g,s){
   main.innerHTML=scheduleHead(g,s)+`<p class="page-sub">جاري تحميل الواجبات...</p>`;
-  loadDay(key).then(()=>{
+  (async()=>{
+    await loadActiveDay(!isSuperUser());
+    if(!isSuperUser())view.day=activeDay;
+    const key=g+'|'+s+'|'+DAYS[view.day];
+    await loadDay(key);
     if(onKey(key))renderSchedule();
-  }).catch(e=>{
-    if(!onKey(key))return;
+  })().catch(e=>{
+    if(view.page!=='schedule')return;
     main.innerHTML=scheduleHead(g,s)+`<div class="err" style="text-align:center;font-size:15px;margin:20px 0">${esc(errText(e))}</div>
     <div style="text-align:center"><button class="btn-secondary" onclick="renderSchedule()">🔄 إعادة المحاولة</button></div>`;
   });
 }
 
 function renderSchedule(){
+  if(!isSuperUser())view.day=activeDay;
   const g=GRADES[view.grade],s=view.section,d=DAYS[view.day];
   const key=g+'|'+s+'|'+d;
-  if(needsLoad(key)){showDay(key,g,s);return;}
+  if(needsLoad(key)){showDay(g,s);return;}
   const rows=db.sched[key];
   const canEdit=Boolean(currentUser);
+  const superMode=isSuperUser();
 
   let h=scheduleHead(g,s);
 
@@ -594,16 +642,17 @@ function renderSchedule(){
     h+=`<tr><td colspan="${canEdit?4:3}" style="padding:26px;color:#8596a6">لا توجد مواد مضافة لهذا اليوم. يمكنك إضافة مادة جديدة بالزر أدناه.</td></tr>`;
   } else {
     rows.forEach((r,i)=>{
+      const rowCanEdit=(i===0)?superMode:canEdit;
       h+=`<tr>
-        <td><span class="num-badge">${i+1}</span></td>
+        <td>${i===0?'':`<span class="num-badge">${i}</span>`}</td>
         <td>
-          ${canEdit?`<input class="subject-input" value="${esc(r.subject)}" placeholder="اسم المادة" oninput="updateRow('${key}',${i},'subject',this.value)">`:`<b>${esc(r.subject)}</b>`}
+          ${rowCanEdit?`<input class="subject-input" value="${esc(r.subject)}" placeholder="اسم المادة" oninput="updateRow('${key}',${i},'subject',this.value)">`:`<b>${esc(r.subject)}</b>`}
         </td>
         <td>
-          ${canEdit?`<textarea class="hw-input" rows="2" placeholder="اكتب تفاصيل الواجب اليومي هنا..." oninput="updateRow('${key}',${i},'homework',this.value);grow(this)">${esc(r.homework)}</textarea>`:
+          ${rowCanEdit?`<textarea class="hw-input" rows="2" placeholder="اكتب تفاصيل الواجب اليومي هنا..." oninput="updateRow('${key}',${i},'homework',this.value);grow(this)">${esc(r.homework)}</textarea>`:
           `<div class="hw-static">${esc(r.homework)||'<span style="color:#a8b6c4">لا يوجد واجب</span>'}</div>`}
         </td>
-        ${canEdit?`<td><button class="btn-del" title="حذف المادة" onclick="deleteSubject('${key}',${i})">🗑️</button></td>`:''}
+        ${canEdit?`<td>${rowCanEdit?`<button class="btn-del" title="حذف المادة" onclick="deleteSubject('${key}',${i})">🗑️</button>`:''}</td>`:''}
       </tr>`;
     });
   }
@@ -625,6 +674,7 @@ function renderSchedule(){
 function grow(t){t.style.height='auto';t.style.height=Math.max(60,t.scrollHeight+2)+'px';}
 
 function updateRow(key,i,field,val){
+  if(i===0&&!isSuperUser())return;
   if(db.sched[key]&&db.sched[key][i]){
     db.sched[key][i][field]=val;
   }
@@ -650,6 +700,7 @@ async function addSubject(key){
 }
 
 async function deleteSubject(key,i){
+  if(i===0&&!isSuperUser())return;
   if(confirm('هل أنت متأكد من حذف هذه المادة؟')){
     db.sched[key].splice(i,1);
     renderSchedule();
@@ -679,7 +730,7 @@ async function showAdminPanel(){
 }
 function renderAdmin(){
   const active=db.users.filter(u=>u.active).length;
-  let h=`<span class="back-link" onclick="view={page:'grades',grade:null,section:null,day:0};render()">→ رجوع للرئيسية</span>
+  let h=`<span class="back-link" onclick="view={page:'grades',grade:null,section:null,day:activeDay};render()">→ رجوع للرئيسية</span>
   <h2 class="page-title">⚙️ لوحة تحكم المدير العام</h2>
   <p class="page-sub">المستخدمون المسجلون: ${db.users.length} / ${MAX_USERS} — الحسابات النشطة: ${active}</p>
   <div class="panel">
